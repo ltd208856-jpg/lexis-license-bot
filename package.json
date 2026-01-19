@@ -1,0 +1,31 @@
+{
+  "name": "discord-license-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for automated license distribution via SellAuth and KeyAuth integration",
+  "main": "src/bot/index.js",
+  "scripts": {
+    "start": "node src/bot/index.js",
+    "dev": "nodemon src/bot/index.js",
+    "deploy:heroku": "git push heroku main"
+  },
+  "keywords": ["discord", "bot", "license", "keyauth", "sellauth", "automation"],
+  "author": "Lexis Team",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "axios": "^1.6.2",
+    "pg": "^8.11.3",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "rate-limiter-flexible": "^4.0.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}

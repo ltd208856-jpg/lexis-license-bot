@@ -28,7 +28,7 @@ module.exports = {
 
     // Database Configuration
     database: {
-        url: process.env.DATABASE_URL || 'sqlite:./database/licenses.db'
+        url: process.env.DATABASE_URL || 'sqlite:./licenses.db'
     },
 
     // Security Configuration

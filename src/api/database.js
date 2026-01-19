@@ -281,6 +281,28 @@ class Database {
     }
 
     /**
+     * Get all license keys for a specific Discord user
+     */
+    async getUserLicenses(userId) {
+        try {
+            const result = await this.all(
+                `SELECT invoice_id, license_key, product_name, product_id,
+                        amount, currency, redeemed_at
+                 FROM redeemed_invoices
+                 WHERE discord_user_id = ?
+                 ORDER BY redeemed_at DESC`,
+                [userId]
+            );
+
+            logger.info(`Retrieved ${result.length} licenses for user ${userId}`);
+            return result;
+        } catch (error) {
+            logger.error('Error getting user licenses:', error);
+            throw error;
+        }
+    }
+
+    /**
      * Get redemption statistics
      */
     async getRedemptionStats() {

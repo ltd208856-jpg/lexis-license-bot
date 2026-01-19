@@ -1,133 +1,197 @@
-const { Client } = require('pg');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 const config = require('../config/config');
 const logger = require('../utils/logger');
 
 class Database {
     constructor() {
-        this.client = null;
+        this.db = null;
         this.isConnected = false;
+        this.dbPath = this.getDatabasePath();
+    }
+
+    /**
+     * Get database path for SQLite
+     */
+    getDatabasePath() {
+        if (config.database.url.startsWith('sqlite:')) {
+            return config.database.url.replace('sqlite:', '');
+        }
+        return './licenses.db'; // Default SQLite database file
     }
 
     /**
      * Initialize database connection
      */
     async connect() {
-        try {
-            this.client = new Client({
-                connectionString: config.database.url,
-                ssl: config.app.environment === 'production' ? { rejectUnauthorized: false } : false
-            });
+        return new Promise((resolve, reject) => {
+            try {
+                this.db = new sqlite3.Database(this.dbPath, (err) => {
+                    if (err) {
+                        logger.error('Database connection failed:', err);
+                        reject(err);
+                        return;
+                    }
 
-            await this.client.connect();
-            this.isConnected = true;
-            logger.info('Database connected successfully');
+                    this.isConnected = true;
+                    logger.info(`SQLite database connected: ${this.dbPath}`);
 
-            // Run initial migrations
-            await this.createTables();
-        } catch (error) {
-            logger.error('Database connection failed:', error);
-            throw error;
-        }
+                    // Run initial migrations
+                    this.createTables().then(() => {
+                        resolve();
+                    }).catch(reject);
+                });
+            } catch (error) {
+                logger.error('Database connection failed:', error);
+                reject(error);
+            }
+        });
     }
 
     /**
-     * Create necessary tables if they don't exist
+     * Create required tables
      */
     async createTables() {
-        try {
-            // Create redeemed_invoices table
-            await this.client.query(`
-                CREATE TABLE IF NOT EXISTS redeemed_invoices (
-                    id SERIAL PRIMARY KEY,
-                    invoice_id VARCHAR(255) UNIQUE NOT NULL,
-                    discord_user_id VARCHAR(255) NOT NULL,
-                    license_key TEXT NOT NULL,
-                    redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    sellauth_data JSONB,
-                    keyauth_response JSONB,
-                    user_info JSONB
-                );
-            `);
+        const queries = [
+            `CREATE TABLE IF NOT EXISTS redeemed_invoices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id TEXT UNIQUE NOT NULL,
+                discord_user_id TEXT NOT NULL,
+                discord_username TEXT,
+                license_key TEXT NOT NULL,
+                product_name TEXT,
+                product_id TEXT,
+                amount REAL,
+                currency TEXT,
+                customer_email TEXT,
+                redeemed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sellauth_data TEXT,
+                keyauth_response TEXT,
+                user_metadata TEXT
+            )`,
 
-            // Create rate_limits table
-            await this.client.query(`
-                CREATE TABLE IF NOT EXISTS rate_limits (
-                    id SERIAL PRIMARY KEY,
-                    user_id VARCHAR(255) NOT NULL,
-                    action_type VARCHAR(100) NOT NULL,
-                    attempts INTEGER DEFAULT 1,
-                    last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    reset_after TIMESTAMP,
-                    UNIQUE(user_id, action_type)
-                );
-            `);
+            `CREATE TABLE IF NOT EXISTS rate_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                attempts INTEGER DEFAULT 1,
+                first_attempt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_attempt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reset_after DATETIME,
+                UNIQUE(user_id, action)
+            )`,
 
-            // Create audit_log table
-            await this.client.query(`
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id SERIAL PRIMARY KEY,
-                    user_id VARCHAR(255),
-                    action VARCHAR(100) NOT NULL,
-                    details JSONB,
-                    ip_address INET,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            `);
+            `CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                data TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`
+        ];
 
-            // Create indexes for performance
-            await this.client.query(`
-                CREATE INDEX IF NOT EXISTS idx_redeemed_invoices_user_id
-                ON redeemed_invoices(discord_user_id);
-            `);
-
-            await this.client.query(`
-                CREATE INDEX IF NOT EXISTS idx_rate_limits_user_action
-                ON rate_limits(user_id, action_type);
-            `);
-
-            logger.info('Database tables created/verified successfully');
-        } catch (error) {
-            logger.error('Database table creation failed:', error);
-            throw error;
+        for (const query of queries) {
+            await this.run(query);
         }
+
+        logger.info('Database tables created/verified');
     }
 
     /**
-     * Check if an invoice has already been redeemed
-     * @param {string} invoiceId - Invoice ID to check
-     * @returns {boolean} - True if already redeemed
+     * Run a query with parameters
+     */
+    async run(sql, params = []) {
+        return new Promise((resolve, reject) => {
+            this.db.run(sql, params, function(err) {
+                if (err) {
+                    logger.error('Database query failed:', err);
+                    reject(err);
+                } else {
+                    resolve({ lastID: this.lastID, changes: this.changes });
+                }
+            });
+        });
+    }
+
+    /**
+     * Get a single row
+     */
+    async get(sql, params = []) {
+        return new Promise((resolve, reject) => {
+            this.db.get(sql, params, (err, row) => {
+                if (err) {
+                    logger.error('Database query failed:', err);
+                    reject(err);
+                } else {
+                    resolve(row);
+                }
+            });
+        });
+    }
+
+    /**
+     * Get multiple rows
+     */
+    async all(sql, params = []) {
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    logger.error('Database query failed:', err);
+                    reject(err);
+                } else {
+                    resolve(rows);
+                }
+            });
+        });
+    }
+
+    /**
+     * Check if invoice has already been redeemed
      */
     async isInvoiceRedeemed(invoiceId) {
         try {
-            const result = await this.client.query(
-                'SELECT id FROM redeemed_invoices WHERE invoice_id = $1',
+            const result = await this.get(
+                'SELECT id FROM redeemed_invoices WHERE invoice_id = ?',
                 [invoiceId]
             );
-            return result.rows.length > 0;
+            return !!result;
         } catch (error) {
-            logger.error('Error checking invoice redemption status:', error);
+            logger.error('Error checking invoice redemption:', error);
             throw error;
         }
     }
 
     /**
-     * Mark an invoice as redeemed
-     * @param {string} invoiceId - Invoice ID
-     * @param {string} userId - Discord user ID
-     * @param {string} licenseKey - Generated license key
-     * @param {object} sellAuthData - SellAuth response data
-     * @param {object} keyAuthResponse - KeyAuth response data
-     * @param {object} userInfo - Discord user information
+     * Mark invoice as redeemed
      */
-    async markInvoiceRedeemed(invoiceId, userId, licenseKey, sellAuthData, keyAuthResponse, userInfo) {
+    async markInvoiceRedeemed(invoiceId, userId, licenseKey, invoiceDetails, keyAuthResponse, userMetadata) {
         try {
-            await this.client.query(`
-                INSERT INTO redeemed_invoices
-                (invoice_id, discord_user_id, license_key, sellauth_data, keyauth_response, user_info)
-                VALUES ($1, $2, $3, $4, $5, $6)
-            `, [invoiceId, userId, licenseKey, sellAuthData, keyAuthResponse, userInfo]);
+            const result = await this.run(
+                `INSERT INTO redeemed_invoices (
+                    invoice_id, discord_user_id, discord_username, license_key,
+                    product_name, product_id, amount, currency, customer_email,
+                    sellauth_data, keyauth_response, user_metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    invoiceId,
+                    userId,
+                    userMetadata?.username || null,
+                    licenseKey,
+                    invoiceDetails?.productName || null,
+                    invoiceDetails?.productId || null,
+                    invoiceDetails?.amount || null,
+                    invoiceDetails?.currency || null,
+                    invoiceDetails?.customerEmail || null,
+                    JSON.stringify(invoiceDetails),
+                    JSON.stringify(keyAuthResponse),
+                    JSON.stringify(userMetadata)
+                ]
+            );
 
             logger.info(`Invoice ${invoiceId} marked as redeemed for user ${userId}`);
+            return result;
         } catch (error) {
             logger.error('Error marking invoice as redeemed:', error);
             throw error;
@@ -135,82 +199,57 @@ class Database {
     }
 
     /**
-     * Check rate limit for a user action
-     * @param {string} userId - User ID
-     * @param {string} actionType - Type of action (e.g., 'redeem', 'attempt')
-     * @param {number} maxAttempts - Maximum attempts allowed
-     * @param {number} windowHours - Time window in hours
-     * @returns {object} - Rate limit status
+     * Check rate limits for a user
      */
-    async checkRateLimit(userId, actionType, maxAttempts, windowHours) {
+    async checkRateLimit(userId, action, maxAttempts, timeWindowHours) {
         try {
-            const resetAfter = new Date(Date.now() + windowHours * 60 * 60 * 1000);
-            const windowStart = new Date(Date.now() - windowHours * 60 * 60 * 1000);
+            const timeWindow = new Date(Date.now() - timeWindowHours * 60 * 60 * 1000);
 
-            // Get current rate limit status
-            const result = await this.client.query(
-                'SELECT attempts, reset_after FROM rate_limits WHERE user_id = $1 AND action_type = $2',
-                [userId, actionType]
+            const result = await this.get(
+                'SELECT * FROM rate_limits WHERE user_id = ? AND action = ? AND first_attempt > ?',
+                [userId, action, timeWindow.toISOString()]
             );
 
-            if (result.rows.length === 0) {
-                // First attempt - create record
-                await this.client.query(`
-                    INSERT INTO rate_limits (user_id, action_type, attempts, reset_after)
-                    VALUES ($1, $2, 1, $3)
-                `, [userId, actionType, resetAfter]);
+            if (!result) {
+                // No recent attempts, allow and create new record
+                await this.run(
+                    `INSERT OR REPLACE INTO rate_limits
+                     (user_id, action, attempts, first_attempt, last_attempt, reset_after)
+                     VALUES (?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)`,
+                    [userId, action, new Date(Date.now() + timeWindowHours * 60 * 60 * 1000).toISOString()]
+                );
 
                 return {
                     allowed: true,
                     attempts: 1,
                     maxAttempts,
-                    resetAfter
+                    resetAfter: new Date(Date.now() + timeWindowHours * 60 * 60 * 1000)
                 };
             }
 
-            const record = result.rows[0];
-            const currentResetAfter = new Date(record.reset_after);
-
-            // Check if rate limit window has expired
-            if (new Date() > currentResetAfter) {
-                // Reset the counter
-                await this.client.query(`
-                    UPDATE rate_limits
-                    SET attempts = 1, last_attempt = CURRENT_TIMESTAMP, reset_after = $3
-                    WHERE user_id = $1 AND action_type = $2
-                `, [userId, actionType, resetAfter]);
-
+            if (result.attempts >= maxAttempts) {
+                // Rate limit exceeded
                 return {
-                    allowed: true,
-                    attempts: 1,
+                    allowed: false,
+                    attempts: result.attempts,
                     maxAttempts,
-                    resetAfter
+                    resetAfter: new Date(result.reset_after)
                 };
             }
 
-            // Check if under the limit
-            if (record.attempts < maxAttempts) {
-                await this.client.query(`
-                    UPDATE rate_limits
-                    SET attempts = attempts + 1, last_attempt = CURRENT_TIMESTAMP
-                    WHERE user_id = $1 AND action_type = $2
-                `, [userId, actionType]);
+            // Increment attempts
+            await this.run(
+                'UPDATE rate_limits SET attempts = attempts + 1, last_attempt = CURRENT_TIMESTAMP WHERE user_id = ? AND action = ?',
+                [userId, action]
+            );
 
-                return {
-                    allowed: true,
-                    attempts: record.attempts + 1,
-                    maxAttempts,
-                    resetAfter: currentResetAfter
-                };
-            }
-
-            // Rate limited
             return {
-                allowed: false,
-                attempts: record.attempts,
+                allowed: true,
+                attempts: result.attempts + 1,
                 maxAttempts,
-                resetAfter: currentResetAfter
+                resetAfter: new Date(result.reset_after)
             };
+
         } catch (error) {
             logger.error('Error checking rate limit:', error);
             throw error;
@@ -218,46 +257,46 @@ class Database {
     }
 
     /**
-     * Log an action for audit purposes
-     * @param {string} userId - User ID
-     * @param {string} action - Action performed
-     * @param {object} details - Action details
-     * @param {string} ipAddress - IP address (if available)
+     * Log user actions for audit purposes
      */
-    async logAction(userId, action, details, ipAddress = null) {
+    async logAction(userId, action, data = {}, ipAddress = null, userAgent = null) {
         try {
-            await this.client.query(`
-                INSERT INTO audit_log (user_id, action, details, ip_address)
-                VALUES ($1, $2, $3, $4)
-            `, [userId, action, details, ipAddress]);
+            await this.run(
+                `INSERT INTO audit_log (user_id, action, data, ip_address, user_agent)
+                 VALUES (?, ?, ?, ?, ?)`,
+                [
+                    userId,
+                    action,
+                    JSON.stringify(data),
+                    ipAddress,
+                    userAgent
+                ]
+            );
+
+            logger.debug(`Logged action: ${action} for user ${userId}`);
         } catch (error) {
             logger.error('Error logging action:', error);
-            // Don't throw here as audit logging shouldn't break main functionality
+            // Don't throw error for audit logging failures
         }
     }
 
     /**
      * Get redemption statistics
-     * @returns {object} - Statistics object
      */
-    async getStats() {
+    async getRedemptionStats() {
         try {
-            const [totalRedemptions, todayRedemptions, uniqueUsers] = await Promise.all([
-                this.client.query('SELECT COUNT(*) as count FROM redeemed_invoices'),
-                this.client.query(`
-                    SELECT COUNT(*) as count FROM redeemed_invoices
-                    WHERE redeemed_at >= CURRENT_DATE
-                `),
-                this.client.query('SELECT COUNT(DISTINCT discord_user_id) as count FROM redeemed_invoices')
-            ]);
+            const totalRedemptions = await this.get('SELECT COUNT(*) as count FROM redeemed_invoices');
+            const todayRedemptions = await this.get(
+                `SELECT COUNT(*) as count FROM redeemed_invoices
+                 WHERE date(redeemed_at) = date('now')`
+            );
 
             return {
-                totalRedemptions: parseInt(totalRedemptions.rows[0].count),
-                todayRedemptions: parseInt(todayRedemptions.rows[0].count),
-                uniqueUsers: parseInt(uniqueUsers.rows[0].count)
+                total: totalRedemptions.count,
+                today: todayRedemptions.count
             };
         } catch (error) {
-            logger.error('Error getting stats:', error);
+            logger.error('Error getting redemption stats:', error);
             throw error;
         }
     }
@@ -266,10 +305,33 @@ class Database {
      * Close database connection
      */
     async disconnect() {
-        if (this.client && this.isConnected) {
-            await this.client.end();
-            this.isConnected = false;
-            logger.info('Database disconnected');
+        return new Promise((resolve) => {
+            if (this.db) {
+                this.db.close((err) => {
+                    if (err) {
+                        logger.error('Error closing database:', err);
+                    } else {
+                        logger.info('Database connection closed');
+                    }
+                    this.isConnected = false;
+                    resolve();
+                });
+            } else {
+                resolve();
+            }
+        });
+    }
+
+    /**
+     * Test database connection
+     */
+    async testConnection() {
+        try {
+            await this.get('SELECT 1');
+            return true;
+        } catch (error) {
+            logger.error('Database connection test failed:', error);
+            return false;
         }
     }
 }
